@@ -4,7 +4,7 @@ import math
 import time
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -23,8 +23,10 @@ TOPIC = "esp32/temperatura/tarjeta1"
 ARCHIVO_RESPALDO = "historial_mqtt.csv"
 ZONA_HORARIA = ZoneInfo("America/Bogota")
 
-# Ventana de puntos visibles simultáneamente en la gráfica
-MAX_MOSTRAR = 30
+# Ventana de puntos visibles en modo "En vivo"
+MAX_MOSTRAR_VIVO = 30
+# Máximo de puntos dibujados simultáneamente en bloques de 1 hora (para fluidez visual)
+MAX_PUNTOS_BLOQUE = 360
 INTERVALO_ACTUALIZACION = "1s"
 
 # Límite máximo en RAM para el día actual (1 día a 2s = 43,200 lecturas)
@@ -51,6 +53,56 @@ def obtener_ahora():
 
 def formato_hora(fecha_hora):
     return fecha_hora.strftime("%I:%M:%S%p").lstrip("0").lower()
+
+
+def construir_opciones_slider(df_o_lista, es_hoy=True):
+    """
+    Define el salto de la barra deslizante según la cantidad de datos tomados:
+    - <= 2 horas (<= 3,600 lecturas): marcas cada 10 minutos.
+    - > 2 horas (> 3,600 lecturas): marcas cada 1 hora.
+    """
+    if isinstance(df_o_lista, list):
+        if not df_o_lista:
+            return [], "10 minutos", {}
+        t_min = pd.Timestamp(df_o_lista[0]["Momento"])
+        t_max = pd.Timestamp(df_o_lista[-1]["Momento"])
+        total_pts = len(df_o_lista)
+    else:
+        if df_o_lista.empty:
+            return [], "10 minutos", {}
+        t_min = pd.Timestamp(df_o_lista["Momento"].iloc[0])
+        t_max = pd.Timestamp(df_o_lista["Momento"].iloc[-1])
+        total_pts = len(df_o_lista)
+
+    duracion_horas = (t_max - t_min).total_seconds() / 3600.0
+
+    if duracion_horas <= 2.0 and total_pts <= 3600:
+        freq_str = "10min"
+        paso_td = timedelta(minutes=10)
+        etiqueta_paso = "10 minutos"
+    else:
+        freq_str = "1h"
+        paso_td = timedelta(hours=1)
+        etiqueta_paso = "1 hora"
+
+    inicio_bloque = t_min.floor(freq_str)
+    fin_bloque = t_max.floor(freq_str)
+    marcas_dt = pd.date_range(start=inicio_bloque, end=fin_bloque, freq=freq_str)
+
+    mapa_bloques = {}
+    opciones = []
+    for dt_bloque in marcas_dt:
+        etiqueta = dt_bloque.strftime("%I:%M%p").lstrip("0").lower()
+        if etiqueta not in mapa_bloques:
+            opciones.append(etiqueta)
+            mapa_bloques[etiqueta] = (
+                dt_bloque.to_pydatetime(),
+                (dt_bloque + paso_td).to_pydatetime(),
+            )
+
+    etiqueta_final = "🔴 En vivo" if es_hoy else "⏭ Últimas lecturas"
+    opciones.append(etiqueta_final)
+    return opciones, etiqueta_paso, mapa_bloques
 
 
 # ==========================================
@@ -126,7 +178,6 @@ class RecolectorMQTT:
                 self.total_historico += len(chunk)
                 self.fechas_disponibles.update(chunk["Fecha"].unique())
 
-                # Filtrar solo los registros correspondientes al día de hoy
                 df_hoy = chunk[chunk["Fecha"] == self.fecha_actual]
                 if not df_hoy.empty:
                     momentos = pd.to_datetime(
@@ -208,7 +259,6 @@ class RecolectorMQTT:
                 }
 
                 with self.lock:
-                    # Si cruzó la medianoche, archiva el día anterior y limpia RAM
                     if fecha_str != self.fecha_actual:
                         self._reiniciar_estadisticas_dia(fecha_str)
 
@@ -247,7 +297,7 @@ recolector = obtener_recolector()
 
 
 # ==========================================
-# 4. CARGA CACHEADA DE DÍAS ANTERIORES
+# 4. CARGA CACHEADA DE DÍAS ANTERIORES Y CSV
 # ==========================================
 
 @st.cache_data(ttl=60, show_spinner="Cargando registros del día seleccionado...")
@@ -289,16 +339,29 @@ def cargar_datos_dia_historico(fecha_objetivo):
     return df_dia
 
 
+@st.cache_data(ttl=60)
+def obtener_csv_dia_historico(fecha_objetivo):
+    """Genera los bytes CSV de un día anterior cacheado para descarga instantánea."""
+    df_dia = cargar_datos_dia_historico(fecha_objetivo)
+    if df_dia.empty:
+        return b""
+    return df_dia[["Fecha", "Hora", "Temperatura (°C)"]].to_csv(index=False).encode("utf-8-sig")
+
+
+@st.cache_data(ttl=5)
+def obtener_csv_hoy_cacheado(fecha_hoy, total_hoy):
+    """Genera los bytes CSV del día actual cada 5s para no sobrecargar el ciclo de 1s."""
+    with recolector.lock:
+        datos = list(recolector.historial_hoy)
+    if not datos:
+        return b""
+    df_hoy = pd.DataFrame(datos)[["Fecha", "Hora", "Temperatura (°C)"]]
+    return df_hoy.to_csv(index=False).encode("utf-8-sig")
+
+
 # ==========================================
 # 5. ESTADO DE NAVEGACIÓN DE LA INTERFAZ
 # ==========================================
-
-if "grafica_pausada" not in st.session_state:
-    st.session_state.grafica_pausada = False
-
-if "offset_grafica" not in st.session_state:
-    # 0 = extremo más reciente (en vivo). > 0 = número de lecturas hacia atrás.
-    st.session_state.offset_grafica = 0
 
 if "fecha_seleccionada" not in st.session_state:
     st.session_state.fecha_seleccionada = obtener_ahora().strftime("%Y-%m-%d")
@@ -337,16 +400,14 @@ def dashboard():
         total_global = recolector.total_historico
         fechas_disp = sorted(recolector.fechas_disponibles | {fecha_hoy}, reverse=True)
 
-        # Estadísticas O(1) de hoy
         count_hoy = recolector.count_hoy
         suma_hoy = recolector.suma_hoy
         min_hoy = recolector.min_hoy
         max_hoy = recolector.max_hoy
 
-        # Copia rápida de la lista del día actual
         lista_hoy = list(recolector.historial_hoy)
 
-    # Calcular estado real de la ESP32 (latido menor a TIMEOUT_ESP32_SEGUNDOS)
+    # Calcular estado real de la ESP32
     if ultimo_ts is not None:
         segundos_sin_datos = time.monotonic() - ultimo_ts
         esp32_conectada = segundos_sin_datos <= TIMEOUT_ESP32_SEGUNDOS
@@ -355,10 +416,10 @@ def dashboard():
         esp32_conectada = False
 
     # ==========================================
-    # 8. SELECTOR DE DÍA Y EXPORTACIÓN DIRECTA
+    # 8. SELECTOR DE DÍA Y EXPORTACIÓN CSV (2 OPCIONES)
     # ==========================================
 
-    col_fecha, col_export = st.columns([2, 2])
+    col_fecha, col_export = st.columns([2, 3])
 
     with col_fecha:
         st.subheader("📅 Selección de jornada")
@@ -367,50 +428,20 @@ def dashboard():
             st.session_state.fecha_seleccionada = fecha_hoy
 
         fecha_elegida = st.selectbox(
-            "Día a visualizar:",
+            "Día a visualizar y exportar:",
             options=fechas_disp,
             index=fechas_disp.index(st.session_state.fecha_seleccionada),
             format_func=lambda f: f"{f} (Hoy - Tiempo real)" if f == fecha_hoy else f"{f} (Historial guardado)",
             key="selector_dia_widget",
         )
 
-        # Si el usuario cambió de día, reiniciar el desplazamiento de la gráfica
         if fecha_elegida != st.session_state.fecha_seleccionada:
             st.session_state.fecha_seleccionada = fecha_elegida
-            st.session_state.offset_grafica = 0
-            st.session_state.grafica_pausada = False
             st.rerun()
 
     es_hoy = (fecha_elegida == fecha_hoy)
 
-    with col_export:
-        st.subheader("📥 Exportación CSV")
-        if os.path.exists(ARCHIVO_RESPALDO) and total_global > 0:
-            # Lectura directa desde disco sin reconstruir DataFrames cada segundo
-            with open(ARCHIVO_RESPALDO, "rb") as archivo_csv:
-                st.download_button(
-                    label=f"📥 Descargar historial completo ({total_global:,} lecturas)",
-                    data=archivo_csv,
-                    file_name="historial_completo_temperaturas.csv",
-                    mime="text/csv",
-                    key="descargar_csv_global",
-                )
-            st.caption(
-                f"Total almacenado en disco: {total_global:,} registros | "
-                f"Días registrados: {len(fechas_disp)}"
-            )
-        else:
-            st.button(
-                "📥 Descargar historial completo CSV",
-                disabled=True,
-                key="descargar_csv_vacio",
-            )
-            st.caption("Esperando lecturas para generar el respaldo CSV.")
-
-    # ==========================================
-    # 9. PREPARACIÓN DE DATOS DEL DÍA ELEGIDO
-    # ==========================================
-
+    # Preparar datos del día elegido
     if es_hoy:
         total_dia = len(lista_hoy)
         if total_dia > 0:
@@ -420,6 +451,7 @@ def dashboard():
             temp_prom = suma_hoy / count_hoy
         else:
             temp_actual = temp_min = temp_max = temp_prom = None
+        df_dia_historico = None
     else:
         df_dia_historico = cargar_datos_dia_historico(fecha_elegida)
         total_dia = len(df_dia_historico)
@@ -431,8 +463,61 @@ def dashboard():
         else:
             temp_actual = temp_min = temp_max = temp_prom = None
 
+    with col_export:
+        st.subheader("📥 Exportación de datos CSV")
+        col_csv_general, col_csv_dia = st.columns(2)
+
+        # Opción 1: CSV General de todos los datos acumulados
+        with col_csv_general:
+            if os.path.exists(ARCHIVO_RESPALDO) and total_global > 0:
+                with open(ARCHIVO_RESPALDO, "rb") as archivo_csv:
+                    st.download_button(
+                        label=f"🌐 CSV General ({total_global:,} reg.)",
+                        data=archivo_csv,
+                        file_name="historial_general_temperaturas.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="descargar_csv_general",
+                    )
+            else:
+                st.button(
+                    "🌐 CSV General (0 reg.)",
+                    disabled=True,
+                    use_container_width=True,
+                    key="descargar_csv_general_vacio",
+                )
+
+        # Opción 2: CSV del día seleccionado en el menú interactivo
+        with col_csv_dia:
+            if total_dia > 0:
+                csv_dia_bytes = (
+                    obtener_csv_hoy_cacheado(fecha_hoy, total_dia)
+                    if es_hoy
+                    else obtener_csv_dia_historico(fecha_elegida)
+                )
+                st.download_button(
+                    label=f"📅 CSV del {fecha_elegida} ({total_dia:,} reg.)",
+                    data=csv_dia_bytes,
+                    file_name=f"historial_temperaturas_{fecha_elegida}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key=f"descargar_csv_dia_{fecha_elegida}",
+                )
+            else:
+                st.button(
+                    f"📅 CSV del {fecha_elegida} (0 reg.)",
+                    disabled=True,
+                    use_container_width=True,
+                    key="descargar_csv_dia_vacio",
+                )
+
+        st.caption(
+            f"Historial general: {total_global:,} lecturas en {len(fechas_disp)} día(s) | "
+            f"Jornada seleccionada ({fecha_elegida}): {total_dia:,} lecturas."
+        )
+
     # ==========================================
-    # 10. INDICADORES DE TEMPERATURA Y CONEXIÓN
+    # 9. INDICADORES DE TEMPERATURA Y CONEXIÓN
     # ==========================================
 
     titulo_kpi = "📊 Indicadores de Hoy (En vivo)" if es_hoy else f"📊 Resumen del {fecha_elegida}"
@@ -482,151 +567,133 @@ def dashboard():
     )
 
     # ==========================================
-    # 11. GRÁFICA INTERACTIVA CON RETROCESO
+    # 10. GRÁFICA CON BARRA DESLIZANTE ADAPTATIVA
     # ==========================================
 
     st.subheader("📈 Comportamiento térmico")
 
     if total_dia > 0:
-        max_offset = max(0, total_dia - MAX_MOSTRAR)
+        datos_fuente = lista_hoy if es_hoy else df_dia_historico
+        opciones_slider, etiqueta_paso, mapa_bloques = construir_opciones_slider(
+            datos_fuente, es_hoy=es_hoy
+        )
 
-        # Si el usuario retrocedió manualmente, mantener su posición relativa aunque lleguen nuevos datos
-        if st.session_state.offset_grafica > max_offset:
-            st.session_state.offset_grafica = max_offset
+        slider_key = f"slider_tiempo_{fecha_elegida}"
+        opcion_final = opciones_slider[-1]
 
-        # Barra de controles de navegación temporal
-        c_ini, c_ret30, c_ret10, c_pausa, c_ava10, c_ava30, c_vivo = st.columns(7)
+        # Inicializar el círculo en el extremo derecho ("En vivo" / "Últimas lecturas")
+        if slider_key not in st.session_state or st.session_state[slider_key] not in opciones_slider:
+            st.session_state[slider_key] = opcion_final
 
-        with c_ini:
-            if st.button("⏮ Inicio", use_container_width=True, disabled=(st.session_state.offset_grafica >= max_offset)):
-                st.session_state.offset_grafica = max_offset
-                st.session_state.grafica_pausada = True
-                st.rerun()
+        posicion_actual = st.select_slider(
+            f"Desliza el círculo para navegar por intervalos de **{etiqueta_paso}** "
+            f"(extremo derecho = {opcion_final}):",
+            options=opciones_slider,
+            key=slider_key,
+        )
 
-        with c_ret30:
-            if st.button(f"⏪ -{MAX_MOSTRAR}", use_container_width=True, disabled=(st.session_state.offset_grafica >= max_offset)):
-                st.session_state.offset_grafica = min(max_offset, st.session_state.offset_grafica + MAX_MOSTRAR)
-                st.session_state.grafica_pausada = True
-                st.rerun()
-
-        with c_ret10:
-            if st.button("◀ -10", use_container_width=True, disabled=(st.session_state.offset_grafica >= max_offset)):
-                st.session_state.offset_grafica = min(max_offset, st.session_state.offset_grafica + 10)
-                st.session_state.grafica_pausada = True
-                st.rerun()
-
-        with c_pausa:
-            if st.session_state.grafica_pausada:
-                if st.button("▶ Reanudar", use_container_width=True):
-                    st.session_state.grafica_pausada = False
-                    st.rerun()
+        # Filtrar datos según la posición elegida en la barra
+        if posicion_actual == opcion_final:
+            if es_hoy:
+                df_grafica = pd.DataFrame(lista_hoy[-MAX_MOSTRAR_VIVO:])
             else:
-                if st.button("⏸ Pausar", use_container_width=True):
-                    st.session_state.grafica_pausada = True
-                    st.rerun()
+                df_grafica = df_dia_historico.tail(MAX_MOSTRAR_VIVO).copy()
 
-        with c_ava10:
-            if st.button("▶ +10", use_container_width=True, disabled=(st.session_state.offset_grafica == 0)):
-                st.session_state.offset_grafica = max(0, st.session_state.offset_grafica - 10)
-                st.rerun()
+            estado_msg = (
+                f"Mostrando las últimas **{len(df_grafica)}** lecturas en tiempo real "
+                f"(escala de navegación actual: cada **{etiqueta_paso}**)."
+                if es_hoy
+                else f"Mostrando el cierre del **{fecha_elegida}** (últimas **{len(df_grafica)}** lecturas)."
+            )
+            st.success(estado_msg)
 
-        with c_ava30:
-            if st.button(f"⏩ +{MAX_MOSTRAR}", use_container_width=True, disabled=(st.session_state.offset_grafica == 0)):
-                st.session_state.offset_grafica = max(0, st.session_state.offset_grafica - MAX_MOSTRAR)
-                st.rerun()
-
-        with c_vivo:
-            en_extremo_reciente = (st.session_state.offset_grafica == 0 and not st.session_state.grafica_pausada)
-            etiqueta_vivo = "🔴 En vivo" if es_hoy else "⏭ Final del día"
-            if st.button(etiqueta_vivo, use_container_width=True, disabled=en_extremo_reciente):
-                st.session_state.offset_grafica = 0
-                st.session_state.grafica_pausada = False
-                st.rerun()
-
-        # Si está pausado en vivo (offset == 0) y entran datos nuevos, incrementar offset
-        # para congelar exactamente la ventana que el usuario está observando
-        if es_hoy and st.session_state.grafica_pausada and st.session_state.offset_grafica == 0:
-            pass
-
-        # Calcular ventana exacta [inicio_idx : fin_idx] en O(1)
-        fin_idx = total_dia - st.session_state.offset_grafica
-        inicio_idx = max(0, fin_idx - MAX_MOSTRAR)
-
-        if es_hoy:
-            # Solo se convierte a DataFrame la ventana visible de 30 puntos (O(1))
-            df_grafica = pd.DataFrame(lista_hoy[inicio_idx:fin_idx])
         else:
-            df_grafica = df_dia_historico.iloc[inicio_idx:fin_idx].copy()
+            t_inicio_bloque, t_fin_bloque = mapa_bloques[posicion_actual]
 
-        # Mensaje de estado de la ventana visualizada
-        if st.session_state.offset_grafica > 0:
+            if es_hoy:
+                filtrados = [
+                    r for r in lista_hoy
+                    if t_inicio_bloque <= r["Momento"] < t_fin_bloque
+                ]
+                df_bloque = pd.DataFrame(filtrados)
+            else:
+                mascara = (
+                    (df_dia_historico["Momento"] >= t_inicio_bloque)
+                    & (df_dia_historico["Momento"] < t_fin_bloque)
+                )
+                df_bloque = df_dia_historico[mascara].copy()
+
+            total_en_bloque = len(df_bloque)
+
+            # Submuestreo uniforme solo si el bloque tiene demasiados puntos para Altair
+            if total_en_bloque > MAX_PUNTOS_BLOQUE:
+                salto = math.ceil(total_en_bloque / MAX_PUNTOS_BLOQUE)
+                df_grafica = df_bloque.iloc[::salto].copy()
+            else:
+                df_grafica = df_bloque
+
+            hora_fin_lbl = (
+                pd.Timestamp(t_fin_bloque).strftime("%I:%M%p").lstrip("0").lower()
+            )
             st.info(
-                f"⏪ Modo historial ({fecha_elegida}): Mostrando lecturas "
-                f"**{inicio_idx + 1:,}** a **{fin_idx:,}** de **{total_dia:,}** "
-                f"(retrocedido {st.session_state.offset_grafica:,} lecturas)."
-            )
-        elif st.session_state.grafica_pausada:
-            st.warning(
-                f"⏸ Gráfica pausada en lecturas **{inicio_idx + 1:,}** a **{fin_idx:,}** "
-                f"de **{total_dia:,}**. Las nuevas lecturas siguen guardándose."
-            )
-        else:
-            modo_texto = "actualizándose en tiempo real" if es_hoy else "mostrando cierre del día"
-            st.success(
-                f"Mostrando últimas lecturas (**{inicio_idx + 1:,}** a **{fin_idx:,}** "
-                f"de **{total_dia:,}**) — {modo_texto}."
+                f"⏪ Intervalo seleccionado ({fecha_elegida}): **{posicion_actual} a {hora_fin_lbl}** "
+                f"— **{total_en_bloque:,}** lecturas registradas en este bloque "
+                f"(desliza el círculo al extremo derecho para volver a **{opcion_final}**)."
             )
 
         # Renderizar gráfica Altair
-        puntos = (
-            alt.Chart(df_grafica)
-            .mark_circle(size=140, opacity=0.9)
-            .encode(
-                x=alt.X(
-                    "Momento:T",
-                    title="Hora",
-                    axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0),
-                ),
-                y=alt.Y(
-                    "Temperatura (°C):Q",
-                    title="Temperatura (°C)",
-                    scale=alt.Scale(zero=False),
-                ),
-                tooltip=[
-                    alt.Tooltip("Fecha:N", title="Fecha"),
-                    alt.Tooltip("Hora:N", title="Hora"),
-                    alt.Tooltip("Temperatura (°C):Q", title="Temperatura", format=".2f"),
-                ],
+        if not df_grafica.empty:
+            puntos = (
+                alt.Chart(df_grafica)
+                .mark_circle(size=120, opacity=0.9)
+                .encode(
+                    x=alt.X(
+                        "Momento:T",
+                        title="Hora",
+                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0),
+                    ),
+                    y=alt.Y(
+                        "Temperatura (°C):Q",
+                        title="Temperatura (°C)",
+                        scale=alt.Scale(zero=False),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("Fecha:N", title="Fecha"),
+                        alt.Tooltip("Hora:N", title="Hora"),
+                        alt.Tooltip("Temperatura (°C):Q", title="Temperatura", format=".2f"),
+                    ],
+                )
             )
-        )
 
-        linea = (
-            alt.Chart(df_grafica)
-            .mark_line(strokeWidth=2)
-            .encode(
-                x=alt.X(
-                    "Momento:T",
-                    title="Hora",
-                    axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0),
-                ),
-                y=alt.Y(
-                    "Temperatura (°C):Q",
-                    title="Temperatura (°C)",
-                    scale=alt.Scale(zero=False),
-                ),
+            linea = (
+                alt.Chart(df_grafica)
+                .mark_line(strokeWidth=2)
+                .encode(
+                    x=alt.X(
+                        "Momento:T",
+                        title="Hora",
+                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0),
+                    ),
+                    y=alt.Y(
+                        "Temperatura (°C):Q",
+                        title="Temperatura (°C)",
+                        scale=alt.Scale(zero=False),
+                    ),
+                )
             )
-        )
 
-        grafica = (linea + puntos).properties(height=360).interactive()
-        st.altair_chart(grafica, use_container_width=True)
+            grafica = (linea + puntos).properties(height=360).interactive()
+            st.altair_chart(grafica, use_container_width=True)
 
-        # ==========================================
-        # 12. TABLA DE LECTURAS DE LA VENTANA ACTUAL
-        # ==========================================
+            # ==========================================
+            # 11. TABLA DE LECTURAS DE LA VENTANA ACTUAL
+            # ==========================================
 
-        st.subheader("📋 Lecturas de la ventana seleccionada")
-        df_tabla = df_grafica[["Fecha", "Hora", "Temperatura (°C)"]].tail(10).iloc[::-1]
-        st.dataframe(df_tabla, use_container_width=True, hide_index=True)
+            st.subheader("📋 Lecturas del intervalo seleccionado")
+            df_tabla = df_grafica[["Fecha", "Hora", "Temperatura (°C)"]].tail(10).iloc[::-1]
+            st.dataframe(df_tabla, use_container_width=True, hide_index=True)
+        else:
+            st.warning(f"No se encontraron lecturas dentro del intervalo **{posicion_actual}**.")
 
     else:
         st.info(
@@ -635,7 +702,7 @@ def dashboard():
         )
 
     # ==========================================
-    # 13. ERRORES MQTT
+    # 12. ERRORES MQTT
     # ==========================================
 
     if mqtt_error:
@@ -643,7 +710,7 @@ def dashboard():
 
 
 # ==========================================
-# 14. EJECUTAR DASHBOARD
+# 13. EJECUTAR DASHBOARD
 # ==========================================
 
 dashboard()
