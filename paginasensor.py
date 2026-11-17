@@ -105,7 +105,6 @@ def construir_puntos_division(df_o_lista, es_hoy=True, max_puntos=9):
 
     duracion_seg = max(1.0, (t_max - t_min).total_seconds())
 
-    # Escalas ordenadas desde segundos hasta horas
     escalas = [
         ("10s", timedelta(seconds=10), "10 segundos", "%I:%M:%S%p"),
         ("15s", timedelta(seconds=15), "15 segundos", "%I:%M:%S%p"),
@@ -316,7 +315,6 @@ class RecolectorMQTT:
                     self.total_historico += 1
                     self.fechas_disponibles.add(fecha_str)
 
-                    # Actualizar latido (heartbeat) de la ESP32
                     self.ultimo_mensaje_ts = time.monotonic()
                     self.ultima_hora_esp32 = hora_str
 
@@ -404,16 +402,28 @@ def obtener_csv_hoy_cacheado(fecha_hoy, total_hoy):
         datos = list(recolector.historial_hoy)
     if not datos:
         return b""
-    df_hoy = pd.DataFrame(datos)[["Fecha", "Hora", "Temperatura (°C)"]]
+    df_hoy = pd.DataFrame(
+        [(r["Fecha"], r["Hora"], r["Temperatura (°C)"]) for r in datos],
+        columns=["Fecha", "Hora", "Temperatura (°C)"],
+    )
     return df_hoy.to_csv(index=False).encode("utf-8-sig")
 
 
 # ==========================================
-# 5. ESTADO DE NAVEGACIÓN DE LA INTERFAZ
+# 5. ESTADO DE NAVEGACIÓN Y PAUSA DE LA INTERFAZ
 # ==========================================
 
 if "fecha_seleccionada" not in st.session_state:
     st.session_state.fecha_seleccionada = obtener_ahora().strftime("%Y-%m-%d")
+
+if "grafica_pausada" not in st.session_state:
+    st.session_state.grafica_pausada = False
+
+if "snapshot_grafica" not in st.session_state:
+    st.session_state.snapshot_grafica = pd.DataFrame()
+
+if "ultimo_punto_radio" not in st.session_state:
+    st.session_state.ultimo_punto_radio = None
 
 
 # ==========================================
@@ -486,6 +496,9 @@ def dashboard():
 
         if fecha_elegida != st.session_state.fecha_seleccionada:
             st.session_state.fecha_seleccionada = fecha_elegida
+            st.session_state.grafica_pausada = False
+            st.session_state.snapshot_grafica = pd.DataFrame()
+            st.session_state.ultimo_punto_radio = None
             st.rerun()
 
     es_hoy = (fecha_elegida == fecha_hoy)
@@ -616,7 +629,7 @@ def dashboard():
     )
 
     # ==========================================
-    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN ADAPTATIVOS
+    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN Y PAUSA
     # ==========================================
 
     st.subheader("📈 Comportamiento térmico")
@@ -641,20 +654,69 @@ def dashboard():
             key=radio_key,
         )
 
-        # Filtrar datos según el punto seleccionado
+        # Si el usuario cambió de nodo en la barra, desactivar pausa para mostrar de inmediato ese tramo
+        if st.session_state.ultimo_punto_radio != punto_seleccionado:
+            st.session_state.ultimo_punto_radio = punto_seleccionado
+            if punto_seleccionado != opcion_final:
+                st.session_state.grafica_pausada = False
+
+        # Botón de Pausar / Reanudar gráfica + banner de estado
+        col_btn_pausa, col_estado_graf = st.columns([1, 4])
+
+        with col_btn_pausa:
+            if es_hoy and punto_seleccionado == opcion_final:
+                if st.session_state.grafica_pausada:
+                    if st.button("▶ Reanudar gráfica", use_container_width=True, key="btn_reanudar_graf"):
+                        st.session_state.grafica_pausada = False
+                        st.rerun()
+                else:
+                    if st.button("⏸ Pausar gráfica", use_container_width=True, key="btn_pausar_graf"):
+                        st.session_state.grafica_pausada = True
+                        st.rerun()
+            else:
+                st.button(
+                    "⏸ Pausar gráfica",
+                    disabled=True,
+                    use_container_width=True,
+                    key="btn_pausar_graf_disabled",
+                )
+
+        # Filtrar datos para la gráfica y acoplar la tabla
         if punto_seleccionado == opcion_final:
+            # 1) Datos de la gráfica (últimos 30 puntos o congelados si está pausada)
             if es_hoy:
-                df_grafica = pd.DataFrame(lista_hoy[-MAX_MOSTRAR_VIVO:])
+                if st.session_state.grafica_pausada and not st.session_state.snapshot_grafica.empty:
+                    df_grafica = st.session_state.snapshot_grafica.copy()
+                else:
+                    df_grafica = pd.DataFrame(lista_hoy[-MAX_MOSTRAR_VIVO:])
+                    st.session_state.snapshot_grafica = df_grafica.copy()
+
+                # 2) Tabla predeterminada: TODAS las lecturas del día actual (más reciente arriba)
+                df_tabla = pd.DataFrame(
+                    [(r["Fecha"], r["Hora"], r["Temperatura (°C)"]) for r in reversed(lista_hoy)],
+                    columns=["Fecha", "Hora", "Temperatura (°C)"],
+                )
             else:
                 df_grafica = df_dia_historico.tail(MAX_MOSTRAR_VIVO).copy()
+                # Tabla predeterminada: TODAS las lecturas del día histórico seleccionado
+                df_tabla = df_dia_historico[["Fecha", "Hora", "Temperatura (°C)"]].iloc[::-1].reset_index(drop=True)
 
-            estado_msg = (
-                f"Mostrando las últimas **{len(df_grafica)}** lecturas en tiempo real "
-                f"(divisiones actuales cada **{etiqueta_escala}**)."
-                if es_hoy
-                else f"Mostrando el cierre del **{fecha_elegida}** (últimas **{len(df_grafica)}** lecturas)."
-            )
-            st.success(estado_msg)
+            titulo_tabla = f"📋 Todas las lecturas del día ({fecha_elegida}) — {len(df_tabla):,} registro(s)"
+
+            with col_estado_graf:
+                if es_hoy and st.session_state.grafica_pausada:
+                    st.warning(
+                        "⏸ Gráfica pausada para inspección. Las nuevas lecturas siguen registrándose en segundo plano y en la tabla."
+                    )
+                elif es_hoy:
+                    st.success(
+                        f"Mostrando las últimas **{len(df_grafica)}** lecturas en tiempo real "
+                        f"(divisiones cada **{etiqueta_escala}**)."
+                    )
+                else:
+                    st.success(
+                        f"Mostrando el cierre del **{fecha_elegida}** (últimas **{len(df_grafica)}** lecturas)."
+                    )
 
         else:
             t_inicio_bloque, t_fin_bloque, fmt_hora = mapa_bloques[punto_seleccionado]
@@ -674,20 +736,33 @@ def dashboard():
 
             total_en_bloque = len(df_bloque)
 
+            # Submuestreo solo para la gráfica si el intervalo es muy extenso
             if total_en_bloque > MAX_PUNTOS_BLOQUE:
                 salto = math.ceil(total_en_bloque / MAX_PUNTOS_BLOQUE)
                 df_grafica = df_bloque.iloc[::salto].copy()
             else:
                 df_grafica = df_bloque
 
+            # La tabla se acopla al 100% de las lecturas de ese intervalo seleccionado
+            if not df_bloque.empty:
+                df_tabla = df_bloque[["Fecha", "Hora", "Temperatura (°C)"]].iloc[::-1].reset_index(drop=True)
+            else:
+                df_tabla = pd.DataFrame(columns=["Fecha", "Hora", "Temperatura (°C)"])
+
             hora_fin_lbl = (
                 pd.Timestamp(t_fin_bloque).strftime(fmt_hora).lstrip("0").lower()
             )
-            st.info(
-                f"⏪ Intervalo seleccionado ({fecha_elegida}): **{punto_seleccionado} a {hora_fin_lbl}** "
-                f"— **{total_en_bloque:,}** lecturas en este tramo "
-                f"(haz clic en **{opcion_final}** para volver al seguimiento continuo)."
+            titulo_tabla = (
+                f"📋 Lecturas del intervalo ({punto_seleccionado} a {hora_fin_lbl}) "
+                f"— {total_en_bloque:,} registro(s)"
             )
+
+            with col_estado_graf:
+                st.info(
+                    f"⏪ Intervalo seleccionado ({fecha_elegida}): **{punto_seleccionado} a {hora_fin_lbl}** "
+                    f"— **{total_en_bloque:,}** lecturas en este tramo "
+                    f"(haz clic en **{opcion_final}** para volver al seguimiento continuo)."
+                )
 
         # Renderizar gráfica Altair con márgenes amplios para que ningún punto quede cortado
         if not df_grafica.empty:
@@ -755,12 +830,25 @@ def dashboard():
             st.altair_chart(grafica, use_container_width=True)
 
             # ==========================================
-            # 11. TABLA DE LECTURAS DE LA VENTANA ACTUAL
+            # 11. TABLA DESPLAZABLE ACOPLADA AL DÍA O INTERVALO
             # ==========================================
 
-            st.subheader("📋 Lecturas del intervalo seleccionado")
-            df_tabla = df_grafica[["Fecha", "Hora", "Temperatura (°C)"]].tail(10).iloc[::-1]
-            st.dataframe(df_tabla, use_container_width=True, hide_index=True)
+            st.subheader(titulo_tabla)
+            st.dataframe(
+                df_tabla,
+                use_container_width=True,
+                hide_index=True,
+                height=380,
+                column_config={
+                    "Fecha": st.column_config.TextColumn("Fecha", width="medium"),
+                    "Hora": st.column_config.TextColumn("Hora", width="medium"),
+                    "Temperatura (°C)": st.column_config.NumberColumn(
+                        "Temperatura (°C)",
+                        format="%.2f °C",
+                        width="medium",
+                    ),
+                },
+            )
         else:
             st.warning(f"No se encontraron lecturas dentro del intervalo **{punto_seleccionado}**.")
 
