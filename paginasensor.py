@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 BROKER_IP = "broker.hivemq.com"
 BROKER_PORT = 1883
-TOPIC = "esp32/variables"
+TOPIC = "esp32/temperatura/tarjeta1"
 
 MAX_MOSTRAR = 30
 INTERVALO_ACTUALIZACION = "1s"
