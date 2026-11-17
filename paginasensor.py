@@ -25,7 +25,7 @@ ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 # Ventana de puntos visibles en modo "En vivo"
 MAX_MOSTRAR_VIVO = 30
-# Máximo de puntos dibujados simultáneamente en bloques de 1 hora (para fluidez visual)
+# Máximo de puntos dibujados simultáneamente en bloques extensos (para fluidez visual)
 MAX_PUNTOS_BLOQUE = 360
 INTERVALO_ACTUALIZACION = "1s"
 
@@ -42,6 +42,37 @@ st.set_page_config(
     layout="wide",
 )
 
+# Estilo visual para convertir los puntos de división en una línea de tiempo con nodos clicables
+st.markdown(
+    """
+    <style>
+    div[data-testid="stRadio"] > div[role="radiogroup"] {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.75rem 1rem;
+        background-color: rgba(128, 128, 128, 0.08);
+        border: 1px solid rgba(128, 128, 128, 0.22);
+        border-radius: 10px;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label {
+        background-color: rgba(255, 255, 255, 0.04);
+        padding: 0.35rem 0.7rem;
+        border-radius: 20px;
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        cursor: pointer;
+        transition: all 0.15s ease-in-out;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label:hover {
+        border-color: #1f77b4;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ==========================================
 # 2. UTILIDADES DE FECHA Y HORA
@@ -55,54 +86,72 @@ def formato_hora(fecha_hora):
     return fecha_hora.strftime("%I:%M:%S%p").lstrip("0").lower()
 
 
-def construir_opciones_slider(df_o_lista, es_hoy=True):
+def construir_puntos_division(df_o_lista, es_hoy=True, max_puntos=9):
     """
-    Define el salto de la barra deslizante según la cantidad de datos tomados:
-    - <= 2 horas (<= 3,600 lecturas): marcas cada 10 minutos.
-    - > 2 horas (> 3,600 lecturas): marcas cada 1 hora.
+    Genera puntos específicos de división temporal adaptados automáticamente
+    a la cantidad de datos acumulados en el día (segundos, minutos u horas),
+    dejando siempre como último punto '🔴 En vivo' (o '⏭ Últimas lecturas').
     """
     if isinstance(df_o_lista, list):
         if not df_o_lista:
-            return [], "10 minutos", {}
+            return [], "10 segundos", {}
         t_min = pd.Timestamp(df_o_lista[0]["Momento"])
         t_max = pd.Timestamp(df_o_lista[-1]["Momento"])
-        total_pts = len(df_o_lista)
     else:
         if df_o_lista.empty:
-            return [], "10 minutos", {}
+            return [], "10 segundos", {}
         t_min = pd.Timestamp(df_o_lista["Momento"].iloc[0])
         t_max = pd.Timestamp(df_o_lista["Momento"].iloc[-1])
-        total_pts = len(df_o_lista)
 
-    duracion_horas = (t_max - t_min).total_seconds() / 3600.0
+    duracion_seg = max(1.0, (t_max - t_min).total_seconds())
 
-    if duracion_horas <= 2.0 and total_pts <= 3600:
-        freq_str = "10min"
-        paso_td = timedelta(minutes=10)
-        etiqueta_paso = "10 minutos"
-    else:
-        freq_str = "1h"
-        paso_td = timedelta(hours=1)
-        etiqueta_paso = "1 hora"
+    # Escalas ordenadas desde segundos hasta horas
+    escalas = [
+        ("10s", timedelta(seconds=10), "10 segundos", "%I:%M:%S%p"),
+        ("15s", timedelta(seconds=15), "15 segundos", "%I:%M:%S%p"),
+        ("30s", timedelta(seconds=30), "30 segundos", "%I:%M:%S%p"),
+        ("1min", timedelta(minutes=1), "1 minuto", "%I:%M%p"),
+        ("2min", timedelta(minutes=2), "2 minutos", "%I:%M%p"),
+        ("5min", timedelta(minutes=5), "5 minutos", "%I:%M%p"),
+        ("10min", timedelta(minutes=10), "10 minutos", "%I:%M%p"),
+        ("15min", timedelta(minutes=15), "15 minutos", "%I:%M%p"),
+        ("30min", timedelta(minutes=30), "30 minutos", "%I:%M%p"),
+        ("1h", timedelta(hours=1), "1 hora", "%I:%M%p"),
+        ("2h", timedelta(hours=2), "2 horas", "%I:%M%p"),
+        ("3h", timedelta(hours=3), "3 horas", "%I:%M%p"),
+        ("4h", timedelta(hours=4), "4 horas", "%I:%M%p"),
+    ]
+
+    elegida = escalas[-1]
+    for freq_str, paso_td, etiqueta_escala, fmt_hora in escalas:
+        if (duracion_seg / paso_td.total_seconds()) <= max_puntos:
+            elegida = (freq_str, paso_td, etiqueta_escala, fmt_hora)
+            break
+
+    freq_str, paso_td, etiqueta_escala, fmt_hora = elegida
 
     inicio_bloque = t_min.floor(freq_str)
     fin_bloque = t_max.floor(freq_str)
     marcas_dt = pd.date_range(start=inicio_bloque, end=fin_bloque, freq=freq_str)
 
+    if len(marcas_dt) > max_puntos:
+        marcas_dt = marcas_dt[-max_puntos:]
+
     mapa_bloques = {}
     opciones = []
     for dt_bloque in marcas_dt:
-        etiqueta = dt_bloque.strftime("%I:%M%p").lstrip("0").lower()
+        etiqueta = dt_bloque.strftime(fmt_hora).lstrip("0").lower()
         if etiqueta not in mapa_bloques:
             opciones.append(etiqueta)
             mapa_bloques[etiqueta] = (
                 dt_bloque.to_pydatetime(),
                 (dt_bloque + paso_td).to_pydatetime(),
+                fmt_hora,
             )
 
     etiqueta_final = "🔴 En vivo" if es_hoy else "⏭ Últimas lecturas"
     opciones.append(etiqueta_final)
-    return opciones, etiqueta_paso, mapa_bloques
+    return opciones, etiqueta_escala, mapa_bloques
 
 
 # ==========================================
@@ -567,33 +616,33 @@ def dashboard():
     )
 
     # ==========================================
-    # 10. GRÁFICA CON BARRA DESLIZANTE ADAPTATIVA
+    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN ADAPTATIVOS
     # ==========================================
 
     st.subheader("📈 Comportamiento térmico")
 
     if total_dia > 0:
         datos_fuente = lista_hoy if es_hoy else df_dia_historico
-        opciones_slider, etiqueta_paso, mapa_bloques = construir_opciones_slider(
+        opciones_puntos, etiqueta_escala, mapa_bloques = construir_puntos_division(
             datos_fuente, es_hoy=es_hoy
         )
 
-        slider_key = f"slider_tiempo_{fecha_elegida}"
-        opcion_final = opciones_slider[-1]
+        radio_key = f"puntos_tiempo_{fecha_elegida}"
+        opcion_final = opciones_puntos[-1]
 
-        # Inicializar el círculo en el extremo derecho ("En vivo" / "Últimas lecturas")
-        if slider_key not in st.session_state or st.session_state[slider_key] not in opciones_slider:
-            st.session_state[slider_key] = opcion_final
+        # Inicializar en el último punto ("🔴 En vivo" / "⏭ Últimas lecturas")
+        if radio_key not in st.session_state or st.session_state[radio_key] not in opciones_puntos:
+            st.session_state[radio_key] = opcion_final
 
-        posicion_actual = st.select_slider(
-            f"Desliza el círculo para navegar por intervalos de **{etiqueta_paso}** "
-            f"(extremo derecho = {opcion_final}):",
-            options=opciones_slider,
-            key=slider_key,
+        punto_seleccionado = st.radio(
+            f"Selecciona un punto de división (escala automática cada **{etiqueta_escala}** — último punto: **{opcion_final}**):",
+            options=opciones_puntos,
+            horizontal=True,
+            key=radio_key,
         )
 
-        # Filtrar datos según la posición elegida en la barra
-        if posicion_actual == opcion_final:
+        # Filtrar datos según el punto seleccionado
+        if punto_seleccionado == opcion_final:
             if es_hoy:
                 df_grafica = pd.DataFrame(lista_hoy[-MAX_MOSTRAR_VIVO:])
             else:
@@ -601,14 +650,14 @@ def dashboard():
 
             estado_msg = (
                 f"Mostrando las últimas **{len(df_grafica)}** lecturas en tiempo real "
-                f"(escala de navegación actual: cada **{etiqueta_paso}**)."
+                f"(divisiones actuales cada **{etiqueta_escala}**)."
                 if es_hoy
                 else f"Mostrando el cierre del **{fecha_elegida}** (últimas **{len(df_grafica)}** lecturas)."
             )
             st.success(estado_msg)
 
         else:
-            t_inicio_bloque, t_fin_bloque = mapa_bloques[posicion_actual]
+            t_inicio_bloque, t_fin_bloque, fmt_hora = mapa_bloques[punto_seleccionado]
 
             if es_hoy:
                 filtrados = [
@@ -625,7 +674,6 @@ def dashboard():
 
             total_en_bloque = len(df_bloque)
 
-            # Submuestreo uniforme solo si el bloque tiene demasiados puntos para Altair
             if total_en_bloque > MAX_PUNTOS_BLOQUE:
                 salto = math.ceil(total_en_bloque / MAX_PUNTOS_BLOQUE)
                 df_grafica = df_bloque.iloc[::salto].copy()
@@ -633,29 +681,42 @@ def dashboard():
                 df_grafica = df_bloque
 
             hora_fin_lbl = (
-                pd.Timestamp(t_fin_bloque).strftime("%I:%M%p").lstrip("0").lower()
+                pd.Timestamp(t_fin_bloque).strftime(fmt_hora).lstrip("0").lower()
             )
             st.info(
-                f"⏪ Intervalo seleccionado ({fecha_elegida}): **{posicion_actual} a {hora_fin_lbl}** "
-                f"— **{total_en_bloque:,}** lecturas registradas en este bloque "
-                f"(desliza el círculo al extremo derecho para volver a **{opcion_final}**)."
+                f"⏪ Intervalo seleccionado ({fecha_elegida}): **{punto_seleccionado} a {hora_fin_lbl}** "
+                f"— **{total_en_bloque:,}** lecturas en este tramo "
+                f"(haz clic en **{opcion_final}** para volver al seguimiento continuo)."
             )
 
-        # Renderizar gráfica Altair
+        # Renderizar gráfica Altair con márgenes amplios para que ningún punto quede cortado
         if not df_grafica.empty:
+            y_min = float(df_grafica["Temperatura (°C)"].min())
+            y_max = float(df_grafica["Temperatura (°C)"].max())
+            rango_y = y_max - y_min
+            margen_y = max(rango_y * 0.22, 0.05)
+            dominio_y = [y_min - margen_y, y_max + margen_y]
+
+            x_min = pd.Timestamp(df_grafica["Momento"].min())
+            x_max = pd.Timestamp(df_grafica["Momento"].max())
+            rango_x = x_max - x_min
+            margen_x = max(rango_x * 0.05, pd.Timedelta(seconds=2))
+            dominio_x = [x_min - margen_x, x_max + margen_x]
+
             puntos = (
                 alt.Chart(df_grafica)
-                .mark_circle(size=120, opacity=0.9)
+                .mark_circle(size=125, opacity=0.95, clip=False)
                 .encode(
                     x=alt.X(
                         "Momento:T",
                         title="Hora",
-                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0),
+                        scale=alt.Scale(domain=dominio_x),
+                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0, tickCount=8),
                     ),
                     y=alt.Y(
                         "Temperatura (°C):Q",
                         title="Temperatura (°C)",
-                        scale=alt.Scale(zero=False),
+                        scale=alt.Scale(domain=dominio_y, zero=False),
                     ),
                     tooltip=[
                         alt.Tooltip("Fecha:N", title="Fecha"),
@@ -667,22 +728,30 @@ def dashboard():
 
             linea = (
                 alt.Chart(df_grafica)
-                .mark_line(strokeWidth=2)
+                .mark_line(strokeWidth=2.2)
                 .encode(
                     x=alt.X(
                         "Momento:T",
                         title="Hora",
-                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0),
+                        scale=alt.Scale(domain=dominio_x),
+                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0, tickCount=8),
                     ),
                     y=alt.Y(
                         "Temperatura (°C):Q",
                         title="Temperatura (°C)",
-                        scale=alt.Scale(zero=False),
+                        scale=alt.Scale(domain=dominio_y, zero=False),
                     ),
                 )
             )
 
-            grafica = (linea + puntos).properties(height=360).interactive()
+            grafica = (
+                (linea + puntos)
+                .properties(
+                    height=400,
+                    padding={"top": 20, "bottom": 12, "left": 12, "right": 24},
+                )
+                .interactive()
+            )
             st.altair_chart(grafica, use_container_width=True)
 
             # ==========================================
@@ -693,7 +762,7 @@ def dashboard():
             df_tabla = df_grafica[["Fecha", "Hora", "Temperatura (°C)"]].tail(10).iloc[::-1]
             st.dataframe(df_tabla, use_container_width=True, hide_index=True)
         else:
-            st.warning(f"No se encontraron lecturas dentro del intervalo **{posicion_actual}**.")
+            st.warning(f"No se encontraron lecturas dentro del intervalo **{punto_seleccionado}**.")
 
     else:
         st.info(
