@@ -42,16 +42,18 @@ st.set_page_config(
     layout="wide",
 )
 
-# Estilo visual para convertir los puntos de división en una línea de tiempo con nodos clicables
+# Estilo visual para los nodos clicables de división temporal
 st.markdown(
     """
     <style>
     div[data-testid="stRadio"] > div[role="radiogroup"] {
         display: flex;
         flex-wrap: wrap;
-        justify-content: space-between;
+        justify-content: flex-start;
         align-items: center;
-        gap: 0.4rem;
+        gap: 0.45rem;
+        max-height: 165px;
+        overflow-y: auto;
         padding: 0.75rem 1rem;
         background-color: rgba(128, 128, 128, 0.08);
         border: 1px solid rgba(128, 128, 128, 0.22);
@@ -86,11 +88,13 @@ def formato_hora(fecha_hora):
     return fecha_hora.strftime("%I:%M:%S%p").lstrip("0").lower()
 
 
-def construir_puntos_division(df_o_lista, es_hoy=True, max_puntos=9):
+def construir_puntos_division(df_o_lista, es_hoy=True, modo_escala="Automática", max_puntos_auto=9):
     """
-    Genera puntos específicos de división temporal adaptados automáticamente
-    a la cantidad de datos acumulados en el día (segundos, minutos u horas),
-    dejando siempre como último punto '🔴 En vivo' (o '⏭ Últimas lecturas').
+    Genera puntos específicos de división temporal según la escala elegida:
+      - 'Horas': divisiones exactas cada 1 hora a lo largo de toda la jornada.
+      - 'Minutos': divisiones exactas cada 10 minutos a lo largo de toda la jornada.
+      - 'Automática': adapta el paso (segundos, minutos u horas) al volumen de datos.
+    El último nodo siempre corresponde a '🔴 En vivo' (o '⏭ Últimas lecturas').
     """
     if isinstance(df_o_lista, list):
         if not df_o_lista:
@@ -105,36 +109,50 @@ def construir_puntos_division(df_o_lista, es_hoy=True, max_puntos=9):
 
     duracion_seg = max(1.0, (t_max - t_min).total_seconds())
 
-    escalas = [
-        ("10s", timedelta(seconds=10), "10 segundos", "%I:%M:%S%p"),
-        ("15s", timedelta(seconds=15), "15 segundos", "%I:%M:%S%p"),
-        ("30s", timedelta(seconds=30), "30 segundos", "%I:%M:%S%p"),
-        ("1min", timedelta(minutes=1), "1 minuto", "%I:%M%p"),
-        ("2min", timedelta(minutes=2), "2 minutos", "%I:%M%p"),
-        ("5min", timedelta(minutes=5), "5 minutos", "%I:%M%p"),
-        ("10min", timedelta(minutes=10), "10 minutos", "%I:%M%p"),
-        ("15min", timedelta(minutes=15), "15 minutos", "%I:%M%p"),
-        ("30min", timedelta(minutes=30), "30 minutos", "%I:%M%p"),
-        ("1h", timedelta(hours=1), "1 hora", "%I:%M%p"),
-        ("2h", timedelta(hours=2), "2 horas", "%I:%M%p"),
-        ("3h", timedelta(hours=3), "3 horas", "%I:%M%p"),
-        ("4h", timedelta(hours=4), "4 horas", "%I:%M%p"),
-    ]
+    if modo_escala == "Horas":
+        freq_str, paso_td, etiqueta_escala, fmt_hora = (
+            "1h",
+            timedelta(hours=1),
+            "1 hora",
+            "%I:%M%p",
+        )
+    elif modo_escala == "Minutos":
+        freq_str, paso_td, etiqueta_escala, fmt_hora = (
+            "10min",
+            timedelta(minutes=10),
+            "10 minutos",
+            "%I:%M%p",
+        )
+    else:
+        escalas = [
+            ("10s", timedelta(seconds=10), "10 segundos", "%I:%M:%S%p"),
+            ("15s", timedelta(seconds=15), "15 segundos", "%I:%M:%S%p"),
+            ("30s", timedelta(seconds=30), "30 segundos", "%I:%M:%S%p"),
+            ("1min", timedelta(minutes=1), "1 minuto", "%I:%M%p"),
+            ("2min", timedelta(minutes=2), "2 minutos", "%I:%M%p"),
+            ("5min", timedelta(minutes=5), "5 minutos", "%I:%M%p"),
+            ("10min", timedelta(minutes=10), "10 minutos", "%I:%M%p"),
+            ("15min", timedelta(minutes=15), "15 minutos", "%I:%M%p"),
+            ("30min", timedelta(minutes=30), "30 minutos", "%I:%M%p"),
+            ("1h", timedelta(hours=1), "1 hora", "%I:%M%p"),
+            ("2h", timedelta(hours=2), "2 horas", "%I:%M%p"),
+            ("3h", timedelta(hours=3), "3 horas", "%I:%M%p"),
+            ("4h", timedelta(hours=4), "4 horas", "%I:%M%p"),
+        ]
 
-    elegida = escalas[-1]
-    for freq_str, paso_td, etiqueta_escala, fmt_hora in escalas:
-        if (duracion_seg / paso_td.total_seconds()) <= max_puntos:
-            elegida = (freq_str, paso_td, etiqueta_escala, fmt_hora)
-            break
-
-    freq_str, paso_td, etiqueta_escala, fmt_hora = elegida
+        elegida = escalas[-1]
+        for f_s, p_td, e_esc, fmt_h in escalas:
+            if (duracion_seg / p_td.total_seconds()) <= max_puntos_auto:
+                elegida = (f_s, p_td, e_esc, fmt_h)
+                break
+        freq_str, paso_td, etiqueta_escala, fmt_hora = elegida
 
     inicio_bloque = t_min.floor(freq_str)
     fin_bloque = t_max.floor(freq_str)
     marcas_dt = pd.date_range(start=inicio_bloque, end=fin_bloque, freq=freq_str)
 
-    if len(marcas_dt) > max_puntos:
-        marcas_dt = marcas_dt[-max_puntos:]
+    if modo_escala == "Automática" and len(marcas_dt) > max_puntos_auto:
+        marcas_dt = marcas_dt[-max_puntos_auto:]
 
     mapa_bloques = {}
     opciones = []
@@ -416,11 +434,20 @@ def obtener_csv_hoy_cacheado(fecha_hoy, total_hoy):
 if "fecha_seleccionada" not in st.session_state:
     st.session_state.fecha_seleccionada = obtener_ahora().strftime("%Y-%m-%d")
 
+if "escala_seleccionada" not in st.session_state:
+    st.session_state.escala_seleccionada = "Automática"
+
 if "grafica_pausada" not in st.session_state:
     st.session_state.grafica_pausada = False
 
 if "snapshot_grafica" not in st.session_state:
     st.session_state.snapshot_grafica = pd.DataFrame()
+
+if "snapshot_tabla" not in st.session_state:
+    st.session_state.snapshot_tabla = pd.DataFrame()
+
+if "snapshot_titulo_tabla" not in st.session_state:
+    st.session_state.snapshot_titulo_tabla = ""
 
 if "ultimo_punto_radio" not in st.session_state:
     st.session_state.ultimo_punto_radio = None
@@ -475,11 +502,12 @@ def dashboard():
         esp32_conectada = False
 
     # ==========================================
-    # 8. SELECTOR DE DÍA Y EXPORTACIÓN CSV (2 OPCIONES)
+    # 8. BLOQUES DE JORNADA, ESCALA Y EXPORTACIÓN CSV
     # ==========================================
 
-    col_fecha, col_export = st.columns([2, 3])
+    col_fecha, col_escala, col_export = st.columns([2, 2, 3])
 
+    # Bloque 1: Selección de jornada
     with col_fecha:
         st.subheader("📅 Selección de jornada")
 
@@ -498,7 +526,40 @@ def dashboard():
             st.session_state.fecha_seleccionada = fecha_elegida
             st.session_state.grafica_pausada = False
             st.session_state.snapshot_grafica = pd.DataFrame()
+            st.session_state.snapshot_tabla = pd.DataFrame()
+            st.session_state.snapshot_titulo_tabla = ""
             st.session_state.ultimo_punto_radio = None
+            st.rerun()
+
+    # Bloque 2: Selección de escala de división (Horas / Minutos / Automática)
+    with col_escala:
+        st.subheader("⏱️ Escala de división")
+
+        opciones_escala = ["Automática", "Horas", "Minutos"]
+        etiquetas_escala = {
+            "Automática": "Automática (Seg. / Min. / Horas)",
+            "Horas": "Horas (Bloques de 1 hora)",
+            "Minutos": "Minutos (Bloques de 10 min)",
+        }
+
+        escala_elegida = st.selectbox(
+            "Granularidad de puntos en gráfica:",
+            options=opciones_escala,
+            index=opciones_escala.index(st.session_state.escala_seleccionada),
+            format_func=lambda e: etiquetas_escala[e],
+            key="selector_escala_widget",
+        )
+
+        if escala_elegida != st.session_state.escala_seleccionada:
+            st.session_state.escala_seleccionada = escala_elegida
+            st.session_state.grafica_pausada = False
+            st.session_state.snapshot_grafica = pd.DataFrame()
+            st.session_state.snapshot_tabla = pd.DataFrame()
+            st.session_state.snapshot_titulo_tabla = ""
+            st.session_state.ultimo_punto_radio = None
+            radio_key_reset = f"puntos_tiempo_{fecha_elegida}_{escala_elegida}"
+            if radio_key_reset in st.session_state:
+                del st.session_state[radio_key_reset]
             st.rerun()
 
     es_hoy = (fecha_elegida == fecha_hoy)
@@ -525,11 +586,11 @@ def dashboard():
         else:
             temp_actual = temp_min = temp_max = temp_prom = None
 
+    # Bloque 3: Exportación CSV (General + Día seleccionado)
     with col_export:
         st.subheader("📥 Exportación de datos CSV")
         col_csv_general, col_csv_dia = st.columns(2)
 
-        # Opción 1: CSV General de todos los datos acumulados
         with col_csv_general:
             if os.path.exists(ARCHIVO_RESPALDO) and total_global > 0:
                 with open(ARCHIVO_RESPALDO, "rb") as archivo_csv:
@@ -549,7 +610,6 @@ def dashboard():
                     key="descargar_csv_general_vacio",
                 )
 
-        # Opción 2: CSV del día seleccionado en el menú interactivo
         with col_csv_dia:
             if total_dia > 0:
                 csv_dia_bytes = (
@@ -575,7 +635,7 @@ def dashboard():
 
         st.caption(
             f"Historial general: {total_global:,} lecturas en {len(fechas_disp)} día(s) | "
-            f"Jornada seleccionada ({fecha_elegida}): {total_dia:,} lecturas."
+            f"Jornada ({fecha_elegida}): {total_dia:,} lecturas."
         )
 
     # ==========================================
@@ -599,7 +659,6 @@ def dashboard():
         col3.metric("Máxima del Día", "-- °C")
         col4.metric("Promedio del Día", "-- °C")
 
-    # Estado específico de la tarjeta ESP32
     if esp32_conectada:
         col5.metric(
             "ESP32 (Sensor)",
@@ -620,7 +679,6 @@ def dashboard():
             delta_color="inverse",
         )
 
-    # Estado de conexión con el Broker MQTT
     col6.metric(
         "Broker MQTT",
         "Conectado 🟢" if mqtt_conectado else "Desconectado 🔴",
@@ -629,38 +687,46 @@ def dashboard():
     )
 
     # ==========================================
-    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN Y PAUSA
+    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN Y PAUSA SINCRONIZADA
     # ==========================================
 
     st.subheader("📈 Comportamiento térmico")
 
     if total_dia > 0:
         datos_fuente = lista_hoy if es_hoy else df_dia_historico
-        opciones_puntos, etiqueta_escala, mapa_bloques = construir_puntos_division(
-            datos_fuente, es_hoy=es_hoy
+        opciones_puntos, etiqueta_paso, mapa_bloques = construir_puntos_division(
+            datos_fuente,
+            es_hoy=es_hoy,
+            modo_escala=escala_elegida,
         )
 
-        radio_key = f"puntos_tiempo_{fecha_elegida}"
+        radio_key = f"puntos_tiempo_{fecha_elegida}_{escala_elegida}"
         opcion_final = opciones_puntos[-1]
 
-        # Inicializar en el último punto ("🔴 En vivo" / "⏭ Últimas lecturas")
         if radio_key not in st.session_state or st.session_state[radio_key] not in opciones_puntos:
             st.session_state[radio_key] = opcion_final
 
+        modo_texto_escala = (
+            f"escala automática cada **{etiqueta_paso}**"
+            if escala_elegida == "Automática"
+            else f"escala fijada en **{escala_elegida}** (cada **{etiqueta_paso}**)"
+        )
+
         punto_seleccionado = st.radio(
-            f"Selecciona un punto de división (escala automática cada **{etiqueta_escala}** — último punto: **{opcion_final}**):",
+            f"Selecciona un punto de división ({modo_texto_escala} — último punto: **{opcion_final}**):",
             options=opciones_puntos,
             horizontal=True,
             key=radio_key,
         )
 
-        # Si el usuario cambió de nodo en la barra, desactivar pausa para mostrar de inmediato ese tramo
         if st.session_state.ultimo_punto_radio != punto_seleccionado:
             st.session_state.ultimo_punto_radio = punto_seleccionado
             if punto_seleccionado != opcion_final:
                 st.session_state.grafica_pausada = False
+                st.session_state.snapshot_grafica = pd.DataFrame()
+                st.session_state.snapshot_tabla = pd.DataFrame()
 
-        # Botón de Pausar / Reanudar gráfica + banner de estado
+        # Botón de Pausar / Reanudar gráfica y tabla + banner de estado
         col_btn_pausa, col_estado_graf = st.columns([1, 4])
 
         with col_btn_pausa:
@@ -683,35 +749,40 @@ def dashboard():
 
         # Filtrar datos para la gráfica y acoplar la tabla
         if punto_seleccionado == opcion_final:
-            # 1) Datos de la gráfica (últimos 30 puntos o congelados si está pausada)
             if es_hoy:
-                if st.session_state.grafica_pausada and not st.session_state.snapshot_grafica.empty:
+                if (
+                    st.session_state.grafica_pausada
+                    and not st.session_state.snapshot_grafica.empty
+                    and not st.session_state.snapshot_tabla.empty
+                ):
                     df_grafica = st.session_state.snapshot_grafica.copy()
+                    df_tabla = st.session_state.snapshot_tabla.copy()
+                    titulo_tabla = st.session_state.snapshot_titulo_tabla
                 else:
                     df_grafica = pd.DataFrame(lista_hoy[-MAX_MOSTRAR_VIVO:])
                     st.session_state.snapshot_grafica = df_grafica.copy()
 
-                # 2) Tabla predeterminada: TODAS las lecturas del día actual (más reciente arriba)
-                df_tabla = pd.DataFrame(
-                    [(r["Fecha"], r["Hora"], r["Temperatura (°C)"]) for r in reversed(lista_hoy)],
-                    columns=["Fecha", "Hora", "Temperatura (°C)"],
-                )
+                    df_tabla = pd.DataFrame(
+                        [(r["Fecha"], r["Hora"], r["Temperatura (°C)"]) for r in reversed(lista_hoy)],
+                        columns=["Fecha", "Hora", "Temperatura (°C)"],
+                    )
+                    titulo_tabla = f"📋 Todas las lecturas del día ({fecha_elegida}) — {len(df_tabla):,} registro(s)"
+                    st.session_state.snapshot_tabla = df_tabla.copy()
+                    st.session_state.snapshot_titulo_tabla = titulo_tabla
             else:
                 df_grafica = df_dia_historico.tail(MAX_MOSTRAR_VIVO).copy()
-                # Tabla predeterminada: TODAS las lecturas del día histórico seleccionado
                 df_tabla = df_dia_historico[["Fecha", "Hora", "Temperatura (°C)"]].iloc[::-1].reset_index(drop=True)
-
-            titulo_tabla = f"📋 Todas las lecturas del día ({fecha_elegida}) — {len(df_tabla):,} registro(s)"
+                titulo_tabla = f"📋 Todas las lecturas del día ({fecha_elegida}) — {len(df_tabla):,} registro(s)"
 
             with col_estado_graf:
                 if es_hoy and st.session_state.grafica_pausada:
                     st.warning(
-                        "⏸ Gráfica pausada para inspección. Las nuevas lecturas siguen registrándose en segundo plano y en la tabla."
+                        "⏸ Gráfica y tabla pausadas para inspección. Las nuevas lecturas siguen guardándose en segundo plano."
                     )
                 elif es_hoy:
                     st.success(
                         f"Mostrando las últimas **{len(df_grafica)}** lecturas en tiempo real "
-                        f"(divisiones cada **{etiqueta_escala}**)."
+                        f"({modo_texto_escala})."
                     )
                 else:
                     st.success(
@@ -736,14 +807,12 @@ def dashboard():
 
             total_en_bloque = len(df_bloque)
 
-            # Submuestreo solo para la gráfica si el intervalo es muy extenso
             if total_en_bloque > MAX_PUNTOS_BLOQUE:
                 salto = math.ceil(total_en_bloque / MAX_PUNTOS_BLOQUE)
                 df_grafica = df_bloque.iloc[::salto].copy()
             else:
                 df_grafica = df_bloque
 
-            # La tabla se acopla al 100% de las lecturas de ese intervalo seleccionado
             if not df_bloque.empty:
                 df_tabla = df_bloque[["Fecha", "Hora", "Temperatura (°C)"]].iloc[::-1].reset_index(drop=True)
             else:
@@ -830,7 +899,7 @@ def dashboard():
             st.altair_chart(grafica, use_container_width=True)
 
             # ==========================================
-            # 11. TABLA DESPLAZABLE ACOPLADA AL DÍA O INTERVALO
+            # 11. TABLA DESPLAZABLE ACOPLADA AL DÍA, INTERVALO Y PAUSA
             # ==========================================
 
             st.subheader(titulo_tabla)
