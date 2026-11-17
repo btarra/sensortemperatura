@@ -91,9 +91,9 @@ def formato_hora(fecha_hora):
 def construir_puntos_division(df_o_lista, es_hoy=True, modo_escala="Automática", max_puntos_auto=9):
     """
     Genera puntos específicos de división temporal según la escala elegida:
-      - 'Horas': divisiones exactas cada 1 hora a lo largo de toda la jornada.
-      - 'Minutos': divisiones exactas cada 10 minutos a lo largo de toda la jornada.
-      - 'Automática': adapta el paso (segundos, minutos u horas) al volumen de datos.
+    - 'Horas': divisiones exactas cada 1 hora a lo largo de toda la jornada.
+    - 'Minutos': divisiones exactas cada 10 minutos a lo largo de toda la jornada.
+    - 'Automática': adapta el paso (segundos, minutos u horas) al volumen de datos.
     El último nodo siempre corresponde a '🔴 En vivo' (o '⏭ Últimas lecturas').
     """
     if isinstance(df_o_lista, list):
@@ -434,6 +434,9 @@ def obtener_csv_hoy_cacheado(fecha_hoy, total_hoy):
 if "fecha_seleccionada" not in st.session_state:
     st.session_state.fecha_seleccionada = obtener_ahora().strftime("%Y-%m-%d")
 
+if "viendo_dia_actual" not in st.session_state:
+    st.session_state.viendo_dia_actual = True
+
 if "escala_seleccionada" not in st.session_state:
     st.session_state.escala_seleccionada = "Automática"
 
@@ -507,12 +510,21 @@ def dashboard():
 
     col_fecha, col_escala, col_export = st.columns([2, 2, 3])
 
-    # Bloque 1: Selección de jornada
+    # Bloque 1: Selección de jornada (con salto automático al cruzar medianoche)
     with col_fecha:
         st.subheader("📅 Selección de jornada")
 
+        if st.session_state.viendo_dia_actual and st.session_state.fecha_seleccionada != fecha_hoy:
+            st.session_state.fecha_seleccionada = fecha_hoy
+            st.session_state.grafica_pausada = False
+            st.session_state.snapshot_grafica = pd.DataFrame()
+            st.session_state.snapshot_tabla = pd.DataFrame()
+            st.session_state.snapshot_titulo_tabla = ""
+            st.session_state.ultimo_punto_radio = None
+
         if st.session_state.fecha_seleccionada not in fechas_disp:
             st.session_state.fecha_seleccionada = fecha_hoy
+            st.session_state.viendo_dia_actual = True
 
         fecha_elegida = st.selectbox(
             "Día a visualizar y exportar:",
@@ -524,6 +536,7 @@ def dashboard():
 
         if fecha_elegida != st.session_state.fecha_seleccionada:
             st.session_state.fecha_seleccionada = fecha_elegida
+            st.session_state.viendo_dia_actual = (fecha_elegida == fecha_hoy)
             st.session_state.grafica_pausada = False
             st.session_state.snapshot_grafica = pd.DataFrame()
             st.session_state.snapshot_tabla = pd.DataFrame()
