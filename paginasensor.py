@@ -2,6 +2,7 @@ import os
 import csv
 import math
 import time
+import sqlite3
 import threading
 from collections import deque
 from datetime import datetime, timedelta
@@ -20,7 +21,9 @@ BROKER_IP = "broker.hivemq.com"
 BROKER_PORT = 1883
 TOPIC = "esp32/temperatura/tarjeta1"
 
-ARCHIVO_RESPALDO = "historial_mqtt.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+ARCHIVO_RESPALDO = os.path.join(BASE_DIR, "historial_mqtt.csv")
+ARCHIVO_DB = os.path.join(BASE_DIR, "historial_mqtt.db")
 ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 # Ventana de puntos visibles en modo "En vivo"
@@ -90,11 +93,8 @@ def formato_hora(fecha_hora):
 
 def construir_puntos_division(df_o_lista, es_hoy=True, modo_escala="Automática", max_puntos_auto=9):
     """
-    Genera puntos específicos de división temporal según la escala elegida:
-    - 'Horas': divisiones exactas cada 1 hora a lo largo de toda la jornada.
-    - 'Minutos': divisiones exactas cada 10 minutos a lo largo de toda la jornada.
-    - 'Automática': adapta el paso (segundos, minutos u horas) al volumen de datos.
-    El último nodo siempre corresponde a '🔴 En vivo' (o '⏭ Últimas lecturas').
+    Genera puntos específicos de división temporal según la escala elegida.
+    Soporta jornadas con 1 sola lectura sin dejar bloques vacíos.
     """
     if isinstance(df_o_lista, list):
         if not df_o_lista:
@@ -172,7 +172,7 @@ def construir_puntos_division(df_o_lista, es_hoy=True, modo_escala="Automática"
 
 
 # ==========================================
-# 3. RECOLECTOR MQTT ESCALABLE EN SEGUNDO PLANO
+# 3. RECOLECTOR MQTT CON MEMORIA PERSISTENTE MULTI-DÍA
 # ==========================================
 
 class RecolectorMQTT:
@@ -180,7 +180,7 @@ class RecolectorMQTT:
         self.lock = threading.Lock()
         self.fecha_actual = obtener_ahora().strftime("%Y-%m-%d")
 
-        # Buffer circular en RAM solo para el día en curso (O(1) memoria)
+        # Buffer circular en RAM solo para el día en curso
         self.historial_hoy = deque(maxlen=MAX_RAM_DIA)
 
         # Estadísticas acumuladas en O(1) para el día actual
@@ -189,9 +189,9 @@ class RecolectorMQTT:
         self.min_hoy = None
         self.max_hoy = None
 
-        # Metadatos históricos globales (millones de filas en disco)
+        # Índice persistente de días anteriores y conteo por fecha
         self.total_historico = 0
-        self.fechas_disponibles = {self.fecha_actual}
+        self.conteo_por_fecha = {self.fecha_actual: 0}
 
         # Estado de conexión Broker MQTT y ESP32
         self.mqtt_connected = False
@@ -199,7 +199,10 @@ class RecolectorMQTT:
         self.ultimo_mensaje_ts = None
         self.ultima_hora_esp32 = None
 
-        self._cargar_respaldo_local()
+        # Conexión SQLite persistente en disco
+        self.db_conn = sqlite3.connect(ARCHIVO_DB, check_same_thread=False)
+        self._inicializar_db_y_migrar_csv()
+        self._cargar_memoria_historica()
         self._iniciar_cliente()
 
     def _reiniciar_estadisticas_dia(self, nueva_fecha):
@@ -209,7 +212,7 @@ class RecolectorMQTT:
         self.suma_hoy = 0.0
         self.min_hoy = None
         self.max_hoy = None
-        self.fechas_disponibles.add(nueva_fecha)
+        self.conteo_por_fecha.setdefault(nueva_fecha, 0)
 
     def _registrar_en_estadisticas_hoy(self, temp):
         self.count_hoy += 1
@@ -219,61 +222,141 @@ class RecolectorMQTT:
         if self.max_hoy is None or temp > self.max_hoy:
             self.max_hoy = temp
 
-    def _cargar_respaldo_local(self):
-        """
-        Lee el CSV por bloques (chunks) para soportar millones de filas sin
-        saturar la RAM: indexa las fechas disponibles, cuenta el total global
-        y carga en memoria únicamente las lecturas del día actual.
-        """
-        if not os.path.exists(ARCHIVO_RESPALDO):
-            return
-
-        try:
-            for chunk in pd.read_csv(ARCHIVO_RESPALDO, chunksize=100_000):
-                if chunk.empty or len(chunk.columns) < 3:
-                    continue
-
-                chunk = chunk.iloc[:, :3].copy()
-                chunk.columns = ["Fecha", "Hora", "Temperatura (°C)"]
-                chunk["Fecha"] = chunk["Fecha"].astype(str).str.strip()
-                chunk["Temperatura (°C)"] = pd.to_numeric(
-                    chunk["Temperatura (°C)"], errors="coerce"
+    def _inicializar_db_y_migrar_csv(self):
+        """Crea la tabla SQLite e importa registros previos de historial_mqtt.csv si existen."""
+        with self.lock:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lecturas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fecha TEXT NOT NULL,
+                    hora TEXT NOT NULL,
+                    temperatura REAL NOT NULL,
+                    momento_iso TEXT NOT NULL
                 )
-                chunk = chunk.dropna(subset=["Fecha", "Hora", "Temperatura (°C)"])
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lecturas_fecha ON lecturas(fecha)")
+            self.db_conn.commit()
 
-                self.total_historico += len(chunk)
-                self.fechas_disponibles.update(chunk["Fecha"].unique())
+            cur.execute("SELECT COUNT(*) FROM lecturas")
+            filas_db = cur.fetchone()[0]
 
-                df_hoy = chunk[chunk["Fecha"] == self.fecha_actual]
-                if not df_hoy.empty:
-                    momentos = pd.to_datetime(
-                        df_hoy["Fecha"] + " " + df_hoy["Hora"].astype(str).str.strip(),
-                        format="mixed",
-                        errors="coerce",
-                    )
-
-                    for idx, row in df_hoy.iterrows():
-                        ts = momentos.loc[idx]
-                        if pd.isna(ts):
+            if filas_db == 0 and os.path.exists(ARCHIVO_RESPALDO):
+                try:
+                    for chunk in pd.read_csv(
+                        ARCHIVO_RESPALDO,
+                        chunksize=100_000,
+                        encoding="utf-8-sig",
+                        on_bad_lines="skip",
+                    ):
+                        if chunk.empty or len(chunk.columns) < 3:
                             continue
-                        momento_bogota = ts.to_pydatetime().replace(tzinfo=ZONA_HORARIA)
-                        temp = float(row["Temperatura (°C)"])
 
-                        self.historial_hoy.append(
-                            {
-                                "Fecha": row["Fecha"],
-                                "Hora": str(row["Hora"]).strip(),
-                                "Temperatura (°C)": temp,
-                                "Momento": momento_bogota,
-                            }
+                        chunk = chunk.iloc[:, :3].copy()
+                        chunk.columns = ["Fecha", "Hora", "Temperatura (°C)"]
+                        chunk["Fecha"] = chunk["Fecha"].astype(str).str.strip()
+                        chunk["Hora"] = chunk["Hora"].astype(str).str.strip()
+                        chunk["Temperatura (°C)"] = pd.to_numeric(
+                            chunk["Temperatura (°C)"], errors="coerce"
                         )
-                        self._registrar_en_estadisticas_hoy(temp)
+                        chunk = chunk.dropna(subset=["Fecha", "Hora", "Temperatura (°C)"])
 
-        except Exception as e:
-            self.mqtt_error = f"Error al indexar historial en disco: {e}"
+                        if chunk.empty:
+                            continue
+
+                        momentos = pd.to_datetime(
+                            chunk["Fecha"] + " " + chunk["Hora"],
+                            format="mixed",
+                            errors="coerce",
+                        )
+
+                        lote_sql = []
+                        for idx, row in chunk.iterrows():
+                            ts = momentos.loc[idx]
+                            if pd.isna(ts):
+                                continue
+                            dt_bogota = ts.to_pydatetime().replace(tzinfo=ZONA_HORARIA)
+                            lote_sql.append(
+                                (
+                                    row["Fecha"],
+                                    row["Hora"],
+                                    float(row["Temperatura (°C)"]),
+                                    dt_bogota.isoformat(),
+                                )
+                            )
+
+                        if lote_sql:
+                            cur.executemany(
+                                "INSERT INTO lecturas (fecha, hora, temperatura, momento_iso) VALUES (?, ?, ?, ?)",
+                                lote_sql,
+                            )
+                            self.db_conn.commit()
+                except Exception as e:
+                    self.mqtt_error = f"Error al migrar CSV histórico a SQLite: {e}"
+
+    def _cargar_memoria_historica(self):
+        """Indexa todas las fechas almacenadas (incluso con 1 sola lectura) y carga el día actual."""
+        with self.lock:
+            try:
+                cur = self.db_conn.cursor()
+                cur.execute("SELECT fecha, COUNT(*) FROM lecturas GROUP BY fecha")
+                resumen_fechas = cur.fetchall()
+
+                self.conteo_por_fecha = {self.fecha_actual: 0}
+                self.total_historico = 0
+                for fecha_db, conteo in resumen_fechas:
+                    self.conteo_por_fecha[fecha_db] = int(conteo)
+                    self.total_historico += int(conteo)
+
+                cur.execute(
+                    """
+                    SELECT fecha, hora, temperatura, momento_iso
+                    FROM lecturas
+                    WHERE fecha = ?
+                    ORDER BY id ASC
+                    """,
+                    (self.fecha_actual,),
+                )
+                filas_hoy = cur.fetchall()
+
+                for fecha_r, hora_r, temp_r, momento_iso_r in filas_hoy:
+                    dt_bogota = datetime.fromisoformat(momento_iso_r)
+                    if dt_bogota.tzinfo is None:
+                        dt_bogota = dt_bogota.replace(tzinfo=ZONA_HORARIA)
+                    temp_val = float(temp_r)
+
+                    self.historial_hoy.append(
+                        {
+                            "Fecha": fecha_r,
+                            "Hora": hora_r,
+                            "Temperatura (°C)": temp_val,
+                            "Momento": dt_bogota,
+                        }
+                    )
+                    self._registrar_en_estadisticas_hoy(temp_val)
+
+            except Exception as e:
+                self.mqtt_error = f"Error al cargar memoria histórica: {e}"
 
     def _guardar_en_disco(self, registro):
-        """Escribe cada lectura directamente en disco (O(1)) sin reescribir el archivo."""
+        """Persiste inmediatamente en SQLite y CSV para no perder ni una lectura aislada."""
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                "INSERT INTO lecturas (fecha, hora, temperatura, momento_iso) VALUES (?, ?, ?, ?)",
+                (
+                    registro["Fecha"],
+                    registro["Hora"],
+                    float(registro["Temperatura (°C)"]),
+                    registro["Momento"].isoformat(),
+                ),
+            )
+            self.db_conn.commit()
+        except Exception as e:
+            self.mqtt_error = f"Error al guardar en SQLite: {e}"
+
         archivo_nuevo = not os.path.exists(ARCHIVO_RESPALDO)
         try:
             with open(ARCHIVO_RESPALDO, mode="a", newline="", encoding="utf-8-sig") as f:
@@ -287,8 +370,44 @@ class RecolectorMQTT:
                         f"{registro['Temperatura (°C)']:.2f}",
                     ]
                 )
+                f.flush()
+                os.fsync(f.fileno())
         except Exception:
             pass
+
+    def obtener_lecturas_fecha(self, fecha_objetivo):
+        """Recupera de SQLite todas las lecturas de un día histórico específico."""
+        with self.lock:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                """
+                SELECT fecha, hora, temperatura, momento_iso
+                FROM lecturas
+                WHERE fecha = ?
+                ORDER BY id ASC
+                """,
+                (fecha_objetivo,),
+            )
+            filas = cur.fetchall()
+
+        if not filas:
+            return pd.DataFrame(columns=["Fecha", "Hora", "Temperatura (°C)", "Momento"])
+
+        registros = []
+        for fecha_r, hora_r, temp_r, momento_iso_r in filas:
+            dt_bogota = datetime.fromisoformat(momento_iso_r)
+            if dt_bogota.tzinfo is None:
+                dt_bogota = dt_bogota.replace(tzinfo=ZONA_HORARIA)
+            registros.append(
+                {
+                    "Fecha": fecha_r,
+                    "Hora": hora_r,
+                    "Temperatura (°C)": float(temp_r),
+                    "Momento": dt_bogota,
+                }
+            )
+
+        return pd.DataFrame(registros)
 
     def _iniciar_cliente(self):
         def on_connect(client, userdata, flags, reason_code, properties):
@@ -331,7 +450,7 @@ class RecolectorMQTT:
                     self.historial_hoy.append(registro)
                     self._registrar_en_estadisticas_hoy(temperatura)
                     self.total_historico += 1
-                    self.fechas_disponibles.add(fecha_str)
+                    self.conteo_por_fecha[fecha_str] = self.conteo_por_fecha.get(fecha_str, 0) + 1
 
                     self.ultimo_mensaje_ts = time.monotonic()
                     self.ultima_hora_esp32 = hora_str
@@ -365,49 +484,16 @@ recolector = obtener_recolector()
 # 4. CARGA CACHEADA DE DÍAS ANTERIORES Y CSV
 # ==========================================
 
-@st.cache_data(ttl=60, show_spinner="Cargando registros del día seleccionado...")
-def cargar_datos_dia_historico(fecha_objetivo):
-    """Extrae desde disco únicamente las lecturas de un día anterior específico."""
-    if not os.path.exists(ARCHIVO_RESPALDO):
-        return pd.DataFrame(columns=["Fecha", "Hora", "Temperatura (°C)", "Momento"])
-
-    bloques = []
-    for chunk in pd.read_csv(ARCHIVO_RESPALDO, chunksize=100_000):
-        if chunk.empty or len(chunk.columns) < 3:
-            continue
-        chunk = chunk.iloc[:, :3].copy()
-        chunk.columns = ["Fecha", "Hora", "Temperatura (°C)"]
-        chunk["Fecha"] = chunk["Fecha"].astype(str).str.strip()
-
-        sub = chunk[chunk["Fecha"] == fecha_objetivo].copy()
-        if not sub.empty:
-            bloques.append(sub)
-
-    if not bloques:
-        return pd.DataFrame(columns=["Fecha", "Hora", "Temperatura (°C)", "Momento"])
-
-    df_dia = pd.concat(bloques, ignore_index=True)
-    df_dia["Temperatura (°C)"] = pd.to_numeric(
-        df_dia["Temperatura (°C)"], errors="coerce"
-    )
-    df_dia = df_dia.dropna(subset=["Temperatura (°C)"]).reset_index(drop=True)
-
-    momentos = pd.to_datetime(
-        df_dia["Fecha"] + " " + df_dia["Hora"].astype(str).str.strip(),
-        format="mixed",
-        errors="coerce",
-    )
-    df_dia["Momento"] = momentos.dt.tz_localize(
-        ZONA_HORARIA, ambiguous="NaT", nonexistent="NaT"
-    )
-    df_dia = df_dia.dropna(subset=["Momento"]).reset_index(drop=True)
-    return df_dia
+@st.cache_data(ttl=30, show_spinner="Cargando registros del día seleccionado...")
+def cargar_datos_dia_historico(fecha_objetivo, conteo_esperado):
+    """Consulta la memoria persistente para el día elegido (se invalida si cambia el conteo)."""
+    return recolector.obtener_lecturas_fecha(fecha_objetivo)
 
 
-@st.cache_data(ttl=60)
-def obtener_csv_dia_historico(fecha_objetivo):
+@st.cache_data(ttl=30)
+def obtener_csv_dia_historico(fecha_objetivo, conteo_esperado):
     """Genera los bytes CSV de un día anterior cacheado para descarga instantánea."""
-    df_dia = cargar_datos_dia_historico(fecha_objetivo)
+    df_dia = cargar_datos_dia_historico(fecha_objetivo, conteo_esperado)
     if df_dia.empty:
         return b""
     return df_dia[["Fecha", "Hora", "Temperatura (°C)"]].to_csv(index=False).encode("utf-8-sig")
@@ -465,7 +551,7 @@ st.title("🌡️ Dashboard: Monitoreo Remoto Wi-Fi")
 st.markdown(
     "Visualización escalable de las lecturas del sensor **DS18B20**, "
     "transmitidas mediante una **ESP32** por MQTT con almacenamiento histórico "
-    "continuo por días."
+    "persistente por días."
 )
 
 st.divider()
@@ -487,7 +573,8 @@ def dashboard():
         ultimo_ts = recolector.ultimo_mensaje_ts
         ultima_hora_esp32 = recolector.ultima_hora_esp32
         total_global = recolector.total_historico
-        fechas_disp = sorted(recolector.fechas_disponibles | {fecha_hoy}, reverse=True)
+        conteos_fechas = dict(recolector.conteo_por_fecha)
+        conteos_fechas.setdefault(fecha_hoy, 0)
 
         count_hoy = recolector.count_hoy
         suma_hoy = recolector.suma_hoy
@@ -495,6 +582,8 @@ def dashboard():
         max_hoy = recolector.max_hoy
 
         lista_hoy = list(recolector.historial_hoy)
+
+    fechas_disp = sorted(conteos_fechas.keys(), reverse=True)
 
     # Calcular estado real de la ESP32
     if ultimo_ts is not None:
@@ -526,11 +615,18 @@ def dashboard():
             st.session_state.fecha_seleccionada = fecha_hoy
             st.session_state.viendo_dia_actual = True
 
+        def formatear_opcion_dia(f):
+            n_reg = conteos_fechas.get(f, 0)
+            sufijo_reg = "1 lectura única" if n_reg == 1 else f"{n_reg:,} lecturas"
+            if f == fecha_hoy:
+                return f"{f} (Hoy — {sufijo_reg})"
+            return f"{f} (Historial — {sufijo_reg})"
+
         fecha_elegida = st.selectbox(
             "Día a visualizar y exportar:",
             options=fechas_disp,
             index=fechas_disp.index(st.session_state.fecha_seleccionada),
-            format_func=lambda f: f"{f} (Hoy - Tiempo real)" if f == fecha_hoy else f"{f} (Historial guardado)",
+            format_func=formatear_opcion_dia,
             key="selector_dia_widget",
         )
 
@@ -576,6 +672,7 @@ def dashboard():
             st.rerun()
 
     es_hoy = (fecha_elegida == fecha_hoy)
+    conteo_esperado_dia = conteos_fechas.get(fecha_elegida, 0)
 
     # Preparar datos del día elegido
     if es_hoy:
@@ -589,7 +686,7 @@ def dashboard():
             temp_actual = temp_min = temp_max = temp_prom = None
         df_dia_historico = None
     else:
-        df_dia_historico = cargar_datos_dia_historico(fecha_elegida)
+        df_dia_historico = cargar_datos_dia_historico(fecha_elegida, conteo_esperado_dia)
         total_dia = len(df_dia_historico)
         if total_dia > 0:
             temp_actual = float(df_dia_historico["Temperatura (°C)"].iloc[-1])
@@ -628,7 +725,7 @@ def dashboard():
                 csv_dia_bytes = (
                     obtener_csv_hoy_cacheado(fecha_hoy, total_dia)
                     if es_hoy
-                    else obtener_csv_dia_historico(fecha_elegida)
+                    else obtener_csv_dia_historico(fecha_elegida, total_dia)
                 )
                 st.download_button(
                     label=f"📅 CSV del {fecha_elegida} ({total_dia:,} reg.)",
@@ -646,9 +743,10 @@ def dashboard():
                     key="descargar_csv_dia_vacio",
                 )
 
+        dias_con_datos = sum(1 for c in conteos_fechas.values() if c > 0)
         st.caption(
-            f"Historial general: {total_global:,} lecturas en {len(fechas_disp)} día(s) | "
-            f"Jornada ({fecha_elegida}): {total_dia:,} lecturas."
+            f"Memoria global: {total_global:,} lecturas en {dias_con_datos} día(s) con registros | "
+            f"Jornada ({fecha_elegida}): {total_dia:,} lectura(s)."
         )
 
     # ==========================================
@@ -661,7 +759,7 @@ def dashboard():
     col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     if temp_actual is not None:
-        etiqueta_ultima = "Temperatura Actual" if es_hoy else "Última del Día"
+        etiqueta_ultima = "Temperatura Actual" if es_hoy else ("Lectura Única" if total_dia == 1 else "Última del Día")
         col1.metric(etiqueta_ultima, f"{temp_actual:.2f} °C")
         col2.metric("Mínima del Día", f"{temp_min:.2f} °C")
         col3.metric("Máxima del Día", f"{temp_max:.2f} °C")
@@ -695,12 +793,12 @@ def dashboard():
     col6.metric(
         "Broker MQTT",
         "Conectado 🟢" if mqtt_conectado else "Desconectado 🔴",
-        delta=f"{total_dia:,} lecturas hoy" if es_hoy else f"{total_dia:,} lecturas",
+        delta=f"{total_dia:,} lectura(s) hoy" if es_hoy else f"{total_dia:,} lectura(s) guardadas",
         delta_color="off",
     )
 
     # ==========================================
-    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN Y PAUSA SINCRONIZADA
+    # 10. GRÁFICA CON PUNTOS DE DIVISIÓN Y SOPORTE DE LECTURA ÚNICA
     # ==========================================
 
     st.subheader("📈 Comportamiento térmico")
@@ -792,6 +890,13 @@ def dashboard():
                     st.warning(
                         "⏸ Gráfica y tabla pausadas para inspección. Las nuevas lecturas siguen guardándose en segundo plano."
                     )
+                elif total_dia == 1:
+                    hora_unica = df_grafica["Hora"].iloc[0]
+                    temp_unica = df_grafica["Temperatura (°C)"].iloc[0]
+                    st.info(
+                        f"📌 Jornada con **1 única lectura registrada** a las **{hora_unica}** "
+                        f"(**{temp_unica:.2f} °C**)."
+                    )
                 elif es_hoy:
                     st.success(
                         f"Mostrando las últimas **{len(df_grafica)}** lecturas en tiempo real "
@@ -842,39 +947,58 @@ def dashboard():
             with col_estado_graf:
                 st.info(
                     f"⏪ Intervalo seleccionado ({fecha_elegida}): **{punto_seleccionado} a {hora_fin_lbl}** "
-                    f"— **{total_en_bloque:,}** lecturas en este tramo "
+                    f"— **{total_en_bloque:,}** lectura(s) en este tramo "
                     f"(haz clic en **{opcion_final}** para volver al seguimiento continuo)."
                 )
 
-        # Renderizar gráfica Altair con márgenes amplios para que ningún punto quede cortado
+        # Renderizar gráfica Altair (adaptada tanto a múltiples puntos como a 1 sola lectura)
         if not df_grafica.empty:
-            y_min = float(df_grafica["Temperatura (°C)"].min())
-            y_max = float(df_grafica["Temperatura (°C)"].max())
+            df_plot = df_grafica.copy()
+            df_plot["Momento_Plot"] = pd.to_datetime(df_plot["Momento"]).dt.tz_localize(None)
+            df_plot["Etiqueta_Unica"] = df_plot.apply(
+                lambda r: f"{r['Temperatura (°C)']:.2f} °C ({r['Hora']})", axis=1
+            )
+
+            es_lectura_unica = len(df_plot) == 1
+
+            y_min = float(df_plot["Temperatura (°C)"].min())
+            y_max = float(df_plot["Temperatura (°C)"].max())
             rango_y = y_max - y_min
-            margen_y = max(rango_y * 0.22, 0.05)
+            margen_y = max(rango_y * 0.22, 0.5 if es_lectura_unica else 0.05)
             dominio_y = [y_min - margen_y, y_max + margen_y]
 
-            x_min = pd.Timestamp(df_grafica["Momento"].min())
-            x_max = pd.Timestamp(df_grafica["Momento"].max())
+            x_min = pd.Timestamp(df_plot["Momento_Plot"].min())
+            x_max = pd.Timestamp(df_plot["Momento_Plot"].max())
             rango_x = x_max - x_min
-            margen_x = max(rango_x * 0.05, pd.Timedelta(seconds=2))
-            dominio_x = [x_min - margen_x, x_max + margen_x]
+            margen_x = pd.Timedelta(seconds=30) if es_lectura_unica else max(rango_x * 0.05, pd.Timedelta(seconds=2))
+            dominio_x = [(x_min - margen_x).isoformat(), (x_max + margen_x).isoformat()]
+
+            eje_x = alt.X(
+                "Momento_Plot:T",
+                title="Hora",
+                scale=alt.Scale(domain=dominio_x),
+                axis=alt.Axis(
+                    format="%I:%M:%S%p",
+                    labelAngle=0,
+                    tickCount=5 if es_lectura_unica else 8,
+                ),
+            )
+            eje_y = alt.Y(
+                "Temperatura (°C):Q",
+                title="Temperatura (°C)",
+                scale=alt.Scale(domain=dominio_y, zero=False),
+            )
 
             puntos = (
-                alt.Chart(df_grafica)
-                .mark_circle(size=125, opacity=0.95, clip=False)
+                alt.Chart(df_plot)
+                .mark_circle(
+                    size=240 if es_lectura_unica else 125,
+                    opacity=1.0 if es_lectura_unica else 0.95,
+                    clip=False,
+                )
                 .encode(
-                    x=alt.X(
-                        "Momento:T",
-                        title="Hora",
-                        scale=alt.Scale(domain=dominio_x),
-                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0, tickCount=8),
-                    ),
-                    y=alt.Y(
-                        "Temperatura (°C):Q",
-                        title="Temperatura (°C)",
-                        scale=alt.Scale(domain=dominio_y, zero=False),
-                    ),
+                    x=eje_x,
+                    y=eje_y,
                     tooltip=[
                         alt.Tooltip("Fecha:N", title="Fecha"),
                         alt.Tooltip("Hora:N", title="Hora"),
@@ -883,29 +1007,34 @@ def dashboard():
                 )
             )
 
-            linea = (
-                alt.Chart(df_grafica)
-                .mark_line(strokeWidth=2.2)
-                .encode(
-                    x=alt.X(
-                        "Momento:T",
-                        title="Hora",
-                        scale=alt.Scale(domain=dominio_x),
-                        axis=alt.Axis(format="%-I:%M:%S%p", labelAngle=0, tickCount=8),
-                    ),
-                    y=alt.Y(
-                        "Temperatura (°C):Q",
-                        title="Temperatura (°C)",
-                        scale=alt.Scale(domain=dominio_y, zero=False),
-                    ),
+            if es_lectura_unica:
+                linea_guia = (
+                    alt.Chart(df_plot)
+                    .mark_rule(strokeDash=[6, 4], strokeWidth=1.8, opacity=0.65)
+                    .encode(y=eje_y)
                 )
-            )
+                etiqueta_punto = (
+                    alt.Chart(df_plot)
+                    .mark_text(dy=-18, fontSize=13, fontWeight="bold")
+                    .encode(
+                        x=eje_x,
+                        y=eje_y,
+                        text="Etiqueta_Unica:N",
+                    )
+                )
+                capa_grafica = linea_guia + puntos + etiqueta_punto
+            else:
+                linea = (
+                    alt.Chart(df_plot)
+                    .mark_line(strokeWidth=2.2)
+                    .encode(x=eje_x, y=eje_y)
+                )
+                capa_grafica = linea + puntos
 
             grafica = (
-                (linea + puntos)
-                .properties(
+                capa_grafica.properties(
                     height=400,
-                    padding={"top": 20, "bottom": 12, "left": 12, "right": 24},
+                    padding={"top": 24, "bottom": 12, "left": 12, "right": 24},
                 )
                 .interactive()
             )
